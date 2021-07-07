@@ -2535,7 +2535,8 @@ bool VarDecl::isNonEscapingByref() const {
 }
 
 bool VarDecl::hasDependentAlignment() const {
-  return getType()->isDependentType() ||
+  QualType T = getType();
+  return T->isDependentType() || T->isUndeducedAutoType() ||
          llvm::any_of(specific_attrs<AlignedAttr>(), [](const AlignedAttr *AA) {
            return AA->isAlignmentDependent();
          });
