@@ -352,13 +352,15 @@ static bool genericValueTraversal(
 
     if (UseValueSimplify && !isa<Constant>(V)) {
       bool UsedAssumedInformation = false;
-      Optional<Constant *> C =
-          A.getAssumedConstant(*V, QueryingAA, UsedAssumedInformation);
-      if (!C.hasValue())
+      Optional<Value *> SimpleV =
+          A.getAssumedSimplified(*V, QueryingAA, UsedAssumedInformation);
+      if (!SimpleV.hasValue())
         continue;
-      if (Value *NewV = C.getValue()) {
-        Worklist.push_back({NewV, CtxI});
-        continue;
+      if (Value *NewV = SimpleV.getValue()) {
+        if (NewV != V) {
+          Worklist.push_back({NewV, CtxI});
+          continue;
+        }
       }
     }
 
@@ -375,10 +377,10 @@ static bool genericValueTraversal(
   return true;
 }
 
-static bool getAssumedUnderlyingObjects(Attributor &A, const Value &Ptr,
-                                        SmallVectorImpl<Value *> &Objects,
-                                        const AbstractAttribute &QueryingAA,
-                                        const Instruction *CtxI) {
+bool AA::getAssumedUnderlyingObjects(Attributor &A, const Value &Ptr,
+                                     SmallVectorImpl<Value *> &Objects,
+                                     const AbstractAttribute &QueryingAA,
+                                     const Instruction *CtxI) {
   auto StripCB = [&](Value *V) { return getUnderlyingObject(V); };
   SmallPtrSet<Value *, 8> SeenObjects;
   auto VisitValueCB = [&SeenObjects](Value &Val, const Instruction *,
@@ -1008,8 +1010,8 @@ protected:
     return *It == Before ? ChangeStatus::UNCHANGED : ChangeStatus::CHANGED;
   }
 
-  /// See AAPointerInfo::forallInterfearingAccesses.
-  bool forallInterfearingAccesses(
+  /// See AAPointerInfo::forallInterferingAccesses.
+  bool forallInterferingAccesses(
       Instruction &I,
       function_ref<bool(const AAPointerInfo::Access &, bool)> CB) const {
     if (!isValidState())
@@ -1068,15 +1070,15 @@ struct AAPointerInfoImpl
     return AAPointerInfo::manifest(A);
   }
 
-  bool forallInterfearingAccesses(
+  bool forallInterferingAccesses(
       LoadInst &LI, function_ref<bool(const AAPointerInfo::Access &, bool)> CB)
       const override {
-    return State::forallInterfearingAccesses(LI, CB);
+    return State::forallInterferingAccesses(LI, CB);
   }
-  bool forallInterfearingAccesses(
+  bool forallInterferingAccesses(
       StoreInst &SI, function_ref<bool(const AAPointerInfo::Access &, bool)> CB)
       const override {
-    return State::forallInterfearingAccesses(SI, CB);
+    return State::forallInterferingAccesses(SI, CB);
   }
 
   ChangeStatus translateAndAddCalleeState(Attributor &A,
@@ -4683,7 +4685,7 @@ struct AACaptureUseTracker final : public CaptureTracker {
   /// conservatively set to true.
   AACaptureUseTracker(Attributor &A, AANoCapture &NoCaptureAA,
                       const AAIsDead &IsDeadAA, AANoCapture::StateType &State,
-                      SmallVectorImpl<const Value *> &PotentialCopies,
+                      SmallSetVector<Value *, 4> &PotentialCopies,
                       unsigned &RemainingUsesToExplore)
       : A(A), NoCaptureAA(NoCaptureAA), IsDeadAA(IsDeadAA), State(State),
         PotentialCopies(PotentialCopies),
@@ -4765,7 +4767,7 @@ struct AACaptureUseTracker final : public CaptureTracker {
   }
 
   /// Register \p CS as potential copy of the value we are checking.
-  void addPotentialCopy(CallBase &CB) { PotentialCopies.push_back(&CB); }
+  void addPotentialCopy(CallBase &CB) { PotentialCopies.insert(&CB); }
 
   /// See CaptureTracker::shouldExplore(...).
   bool shouldExplore(const Use *U) override {
@@ -4806,7 +4808,7 @@ private:
   AANoCapture::StateType &State;
 
   /// Set of potential copies of the tracked value.
-  SmallVectorImpl<const Value *> &PotentialCopies;
+  SmallSetVector<Value *, 4> &PotentialCopies;
 
   /// Global counter to limit the number of explored uses.
   unsigned &RemainingUsesToExplore;
@@ -4814,8 +4816,8 @@ private:
 
 ChangeStatus AANoCaptureImpl::updateImpl(Attributor &A) {
   const IRPosition &IRP = getIRPosition();
-  const Value *V = isArgumentPosition() ? IRP.getAssociatedArgument()
-                                        : &IRP.getAssociatedValue();
+  Value *V = isArgumentPosition() ? IRP.getAssociatedArgument()
+                                  : &IRP.getAssociatedValue();
   if (!V)
     return indicatePessimisticFixpoint();
 
@@ -4881,7 +4883,7 @@ ChangeStatus AANoCaptureImpl::updateImpl(Attributor &A) {
   // Use the CaptureTracker interface and logic with the specialized tracker,
   // defined in AACaptureUseTracker, that can look at in-flight abstract
   // attributes and directly updates the assumed state.
-  SmallVector<const Value *, 4> PotentialCopies;
+  SmallSetVector<Value *, 4> PotentialCopies;
   unsigned RemainingUsesToExplore =
       getDefaultMaxUsesToExploreForCaptureTracking();
   AACaptureUseTracker Tracker(A, *this, IsDeadAA, T, PotentialCopies,
@@ -4890,7 +4892,7 @@ ChangeStatus AANoCaptureImpl::updateImpl(Attributor &A) {
   // Check all potential copies of the associated value until we can assume
   // none will be captured or we have to assume at least one might be.
   unsigned Idx = 0;
-  PotentialCopies.push_back(V);
+  PotentialCopies.insert(V);
   while (T.isAssumed(NO_CAPTURE_MAYBE_RETURNED) && Idx < PotentialCopies.size())
     Tracker.valueMayBeCaptured(PotentialCopies[Idx++]);
 
@@ -5132,7 +5134,7 @@ struct AAValueSimplifyImpl : AAValueSimplify {
 
     Value &Ptr = *L.getPointerOperand();
     SmallVector<Value *, 8> Objects;
-    if (!getAssumedUnderlyingObjects(A, Ptr, Objects, AA, &L))
+    if (!AA::getAssumedUnderlyingObjects(A, Ptr, Objects, AA, &L))
       return false;
 
     for (Value *Obj : Objects) {
@@ -5142,7 +5144,7 @@ struct AAValueSimplifyImpl : AAValueSimplify {
       if (isa<ConstantPointerNull>(Obj)) {
         // A null pointer access can be undefined but any offset from null may
         // be OK. We do not try to optimize the latter.
-        bool UsedAssumedInformation;
+        bool UsedAssumedInformation = false;
         if (!NullPointerIsDefined(L.getFunction(),
                                   Ptr.getType()->getPointerAddressSpace()) &&
             A.getAssumedSimplified(Ptr, AA, UsedAssumedInformation) == Obj)
@@ -5181,7 +5183,7 @@ struct AAValueSimplifyImpl : AAValueSimplify {
 
       auto &PI = A.getAAFor<AAPointerInfo>(AA, IRPosition::value(*Obj),
                                            DepClassTy::REQUIRED);
-      if (!PI.forallInterfearingAccesses(L, CheckAccess))
+      if (!PI.forallInterferingAccesses(L, CheckAccess))
         return false;
     }
     return true;
@@ -5363,66 +5365,87 @@ struct AAValueSimplifyFloating : AAValueSimplifyImpl {
       indicatePessimisticFixpoint();
   }
 
-  /// Check if \p ICmp is an equality comparison (==/!=) with at least one
-  /// nullptr. If so, try to simplify it using AANonNull on the other operand.
-  /// Return true if successful, in that case SimplifiedAssociatedValue will be
-  /// updated and \p Changed is set appropriately.
-  bool checkForNullPtrCompare(Attributor &A, ICmpInst *ICmp,
-                              ChangeStatus &Changed) {
-    if (!ICmp)
-      return false;
-    if (!ICmp->isEquality())
-      return false;
+  /// Check if \p Cmp is a comparison we can simplify.
+  ///
+  /// We handle multiple cases, one in which at least one operand is an
+  /// (assumed) nullptr. If so, try to simplify it using AANonNull on the other
+  /// operand. Return true if successful, in that case SimplifiedAssociatedValue
+  /// will be updated.
+  bool handleCmp(Attributor &A, CmpInst &Cmp) {
+    auto Union = [&](Value &V) {
+      SimplifiedAssociatedValue = AA::combineOptionalValuesInAAValueLatice(
+          SimplifiedAssociatedValue, &V, V.getType());
+      return SimplifiedAssociatedValue != Optional<Value *>(nullptr);
+    };
 
-    // This is a comparison with == or !-. We check for nullptr now.
-    bool Op0IsNull = isa<ConstantPointerNull>(ICmp->getOperand(0));
-    bool Op1IsNull = isa<ConstantPointerNull>(ICmp->getOperand(1));
-    if (!Op0IsNull && !Op1IsNull)
-      return false;
+    Value *LHS = Cmp.getOperand(0);
+    Value *RHS = Cmp.getOperand(1);
 
-    LLVMContext &Ctx = ICmp->getContext();
-    // Check for `nullptr ==/!= nullptr` first:
-    if (Op0IsNull && Op1IsNull) {
-      Value *NewVal = ConstantInt::get(
-          Type::getInt1Ty(Ctx), ICmp->getPredicate() == CmpInst::ICMP_EQ);
-      assert(!SimplifiedAssociatedValue.hasValue() &&
-             "Did not expect non-fixed value for constant comparison");
-      SimplifiedAssociatedValue = NewVal;
-      indicateOptimisticFixpoint();
-      Changed = ChangeStatus::CHANGED;
+    // Simplify the operands first.
+    bool UsedAssumedInformation = false;
+    const auto &SimplifiedLHS =
+        A.getAssumedSimplified(IRPosition::value(*LHS, getCallBaseContext()),
+                               *this, UsedAssumedInformation);
+    if (!SimplifiedLHS.hasValue())
+      return true;
+    if (SimplifiedLHS.getValue())
+      LHS = *SimplifiedLHS;
+
+    const auto &SimplifiedRHS =
+        A.getAssumedSimplified(IRPosition::value(*RHS, getCallBaseContext()),
+                               *this, UsedAssumedInformation);
+    if (!SimplifiedRHS.hasValue())
+      return true;
+    if (SimplifiedRHS.getValue())
+      RHS = *SimplifiedRHS;
+
+    LLVMContext &Ctx = Cmp.getContext();
+    // Handle the trivial case first in which we don't even need to think about
+    // null or non-null.
+    if (LHS == RHS && (Cmp.isTrueWhenEqual() || Cmp.isFalseWhenEqual())) {
+      Constant *NewVal =
+          ConstantInt::get(Type::getInt1Ty(Ctx), Cmp.isTrueWhenEqual());
+      if (!Union(*NewVal))
+        return false;
+      if (!UsedAssumedInformation)
+        indicateOptimisticFixpoint();
       return true;
     }
+
+    // From now on we only handle equalities (==, !=).
+    ICmpInst *ICmp = dyn_cast<ICmpInst>(&Cmp);
+    if (!ICmp || !ICmp->isEquality())
+      return false;
+
+    bool LHSIsNull = isa<ConstantPointerNull>(LHS);
+    bool RHSIsNull = isa<ConstantPointerNull>(RHS);
+    if (!LHSIsNull && !RHSIsNull)
+      return false;
 
     // Left is the nullptr ==/!= non-nullptr case. We'll use AANonNull on the
     // non-nullptr operand and if we assume it's non-null we can conclude the
     // result of the comparison.
-    assert((Op0IsNull || Op1IsNull) &&
+    assert((LHSIsNull || RHSIsNull) &&
            "Expected nullptr versus non-nullptr comparison at this point");
 
     // The index is the operand that we assume is not null.
-    unsigned PtrIdx = Op0IsNull;
+    unsigned PtrIdx = LHSIsNull;
     auto &PtrNonNullAA = A.getAAFor<AANonNull>(
         *this, IRPosition::value(*ICmp->getOperand(PtrIdx)),
         DepClassTy::REQUIRED);
     if (!PtrNonNullAA.isAssumedNonNull())
       return false;
+    UsedAssumedInformation |= !PtrNonNullAA.isKnownNonNull();
 
     // The new value depends on the predicate, true for != and false for ==.
-    Value *NewVal = ConstantInt::get(Type::getInt1Ty(Ctx),
-                                     ICmp->getPredicate() == CmpInst::ICMP_NE);
+    Constant *NewVal = ConstantInt::get(
+        Type::getInt1Ty(Ctx), ICmp->getPredicate() == CmpInst::ICMP_NE);
+    if (!Union(*NewVal))
+      return false;
 
-    assert((!SimplifiedAssociatedValue.hasValue() ||
-            SimplifiedAssociatedValue == NewVal) &&
-           "Did not expect to change value for zero-comparison");
-
-    auto Before = SimplifiedAssociatedValue;
-    SimplifiedAssociatedValue = NewVal;
-
-    if (PtrNonNullAA.isKnownNonNull())
+    if (!UsedAssumedInformation)
       indicateOptimisticFixpoint();
 
-    Changed = Before == SimplifiedAssociatedValue ? ChangeStatus::UNCHANGED
-                                                  : ChangeStatus ::CHANGED;
     return true;
   }
 
@@ -5439,11 +5462,6 @@ struct AAValueSimplifyFloating : AAValueSimplifyImpl {
   ChangeStatus updateImpl(Attributor &A) override {
     auto Before = SimplifiedAssociatedValue;
 
-    ChangeStatus Changed;
-    if (checkForNullPtrCompare(A, dyn_cast<ICmpInst>(&getAnchorValue()),
-                               Changed))
-      return Changed;
-
     auto VisitValueCB = [&](Value &V, const Instruction *CtxI, bool &,
                             bool Stripped) -> bool {
       auto &AA = A.getAAFor<AAValueSimplify>(
@@ -5452,6 +5470,8 @@ struct AAValueSimplifyFloating : AAValueSimplifyImpl {
       if (!Stripped && this == &AA) {
         if (auto *LI = dyn_cast<LoadInst>(&V))
           return updateWithLoad(A, *LI);
+        if (auto *Cmp = dyn_cast<CmpInst>(&V))
+          return handleCmp(A, *Cmp);
         // TODO: Look the instruction and check recursively.
 
         LLVM_DEBUG(dbgs() << "[ValueSimplify] Can't be stripped more : " << V
@@ -5873,8 +5893,8 @@ ChangeStatus AAHeapToStackFunction::updateImpl(Attributor &A) {
       // Use the optimistic version to get the freed objects, ignoring dead
       // branches etc.
       SmallVector<Value *, 8> Objects;
-      if (!getAssumedUnderlyingObjects(A, *DI.CB->getArgOperand(0), Objects,
-                                       *this, DI.CB)) {
+      if (!AA::getAssumedUnderlyingObjects(A, *DI.CB->getArgOperand(0), Objects,
+                                           *this, DI.CB)) {
         LLVM_DEBUG(
             dbgs()
             << "[H2S] Unexpected failure in getAssumedUnderlyingObjects!\n");
@@ -6795,12 +6815,6 @@ struct AAMemoryBehaviorFloating : AAMemoryBehaviorImpl {
   AAMemoryBehaviorFloating(const IRPosition &IRP, Attributor &A)
       : AAMemoryBehaviorImpl(IRP, A) {}
 
-  /// See AbstractAttribute::initialize(...).
-  void initialize(Attributor &A) override {
-    AAMemoryBehaviorImpl::initialize(A);
-    addUsesOf(A, getAssociatedValue());
-  }
-
   /// See AbstractAttribute::updateImpl(...).
   ChangeStatus updateImpl(Attributor &A) override;
 
@@ -6817,21 +6831,11 @@ struct AAMemoryBehaviorFloating : AAMemoryBehaviorImpl {
 private:
   /// Return true if users of \p UserI might access the underlying
   /// variable/location described by \p U and should therefore be analyzed.
-  bool followUsersOfUseIn(Attributor &A, const Use *U,
+  bool followUsersOfUseIn(Attributor &A, const Use &U,
                           const Instruction *UserI);
 
   /// Update the state according to the effect of use \p U in \p UserI.
-  void analyzeUseIn(Attributor &A, const Use *U, const Instruction *UserI);
-
-protected:
-  /// Add the uses of \p V to the `Uses` set we look at during the update step.
-  void addUsesOf(Attributor &A, const Value &V);
-
-  /// Container for (transitive) uses of the associated argument.
-  SmallVector<const Use *, 8> Uses;
-
-  /// Set to remember the uses we already traversed.
-  SmallPtrSet<const Use *, 8> Visited;
+  void analyzeUseIn(Attributor &A, const Use &U, const Instruction *UserI);
 };
 
 /// Memory behavior attribute for function argument.
@@ -6853,11 +6857,8 @@ struct AAMemoryBehaviorArgument : AAMemoryBehaviorFloating {
 
     // Initialize the use vector with all direct uses of the associated value.
     Argument *Arg = getAssociatedArgument();
-    if (!Arg || !A.isFunctionIPOAmendable(*(Arg->getParent()))) {
+    if (!Arg || !A.isFunctionIPOAmendable(*(Arg->getParent())))
       indicatePessimisticFixpoint();
-    } else {
-      addUsesOf(A, *Arg);
-    }
   }
 
   ChangeStatus manifest(Attributor &A) override {
@@ -7090,65 +7091,34 @@ ChangeStatus AAMemoryBehaviorFloating::updateImpl(Attributor &A) {
   // The current assumed state used to determine a change.
   auto AssumedState = S.getAssumed();
 
-  // Liveness information to exclude dead users.
-  // TODO: Take the FnPos once we have call site specific liveness information.
-  const auto &LivenessAA = A.getAAFor<AAIsDead>(
-      *this, IRPosition::function(*IRP.getAssociatedFunction()),
-      DepClassTy::NONE);
-
   // Visit and expand uses until all are analyzed or a fixpoint is reached.
-  for (unsigned i = 0; i < Uses.size() && !isAtFixpoint(); i++) {
-    const Use *U = Uses[i];
-    Instruction *UserI = cast<Instruction>(U->getUser());
-    bool UsedAssumedInformation = false;
-    LLVM_DEBUG(dbgs() << "[AAMemoryBehavior] Use: " << **U << " in " << *UserI
-                      << " [Dead: "
-                      << (A.isAssumedDead(*U, this, &LivenessAA,
-                                          UsedAssumedInformation))
-                      << "]\n");
-    if (A.isAssumedDead(*U, this, &LivenessAA, UsedAssumedInformation))
-      continue;
+  auto UsePred = [&](const Use &U, bool &Follow) -> bool {
+    Instruction *UserI = cast<Instruction>(U.getUser());
+    LLVM_DEBUG(dbgs() << "[AAMemoryBehavior] Use: " << *U << " in " << *UserI
+                      << " \n");
 
     // Droppable users, e.g., llvm::assume does not actually perform any action.
     if (UserI->isDroppable())
-      continue;
+      return true;
 
     // Check if the users of UserI should also be visited.
-    if (followUsersOfUseIn(A, U, UserI))
-      addUsesOf(A, *UserI);
+    Follow = followUsersOfUseIn(A, U, UserI);
 
     // If UserI might touch memory we analyze the use in detail.
     if (UserI->mayReadOrWriteMemory())
       analyzeUseIn(A, U, UserI);
-  }
+
+    return !isAtFixpoint();
+  };
+
+  if (!A.checkForAllUses(UsePred, *this, getAssociatedValue()))
+    return indicatePessimisticFixpoint();
 
   return (AssumedState != getAssumed()) ? ChangeStatus::CHANGED
                                         : ChangeStatus::UNCHANGED;
 }
 
-void AAMemoryBehaviorFloating::addUsesOf(Attributor &A, const Value &V) {
-  SmallVector<const Use *, 8> WL;
-  for (const Use &U : V.uses())
-    WL.push_back(&U);
-
-  while (!WL.empty()) {
-    const Use *U = WL.pop_back_val();
-    if (!Visited.insert(U).second)
-      continue;
-
-    const Instruction *UserI = cast<Instruction>(U->getUser());
-    if (UserI->mayReadOrWriteMemory()) {
-      Uses.push_back(U);
-      continue;
-    }
-    if (!followUsersOfUseIn(A, U, UserI))
-      continue;
-    for (const Use &UU : UserI->uses())
-      WL.push_back(&UU);
-  }
-}
-
-bool AAMemoryBehaviorFloating::followUsersOfUseIn(Attributor &A, const Use *U,
+bool AAMemoryBehaviorFloating::followUsersOfUseIn(Attributor &A, const Use &U,
                                                   const Instruction *UserI) {
   // The loaded value is unrelated to the pointer argument, no need to
   // follow the users of the load.
@@ -7158,7 +7128,7 @@ bool AAMemoryBehaviorFloating::followUsersOfUseIn(Attributor &A, const Use *U,
   // By default we follow all uses assuming UserI might leak information on U,
   // we have special handling for call sites operands though.
   const auto *CB = dyn_cast<CallBase>(UserI);
-  if (!CB || !CB->isArgOperand(U))
+  if (!CB || !CB->isArgOperand(&U))
     return true;
 
   // If the use is a call argument known not to be captured, the users of
@@ -7167,8 +7137,8 @@ bool AAMemoryBehaviorFloating::followUsersOfUseIn(Attributor &A, const Use *U,
   // general capturing of the underlying argument. The reason is that the
   // call might the argument "through return", which we allow and for which we
   // need to check call users.
-  if (U->get()->getType()->isPointerTy()) {
-    unsigned ArgNo = CB->getArgOperandNo(U);
+  if (U.get()->getType()->isPointerTy()) {
+    unsigned ArgNo = CB->getArgOperandNo(&U);
     const auto &ArgNoCaptureAA = A.getAAFor<AANoCapture>(
         *this, IRPosition::callsite_argument(*CB, ArgNo), DepClassTy::OPTIONAL);
     return !ArgNoCaptureAA.isAssumedNoCapture();
@@ -7177,7 +7147,7 @@ bool AAMemoryBehaviorFloating::followUsersOfUseIn(Attributor &A, const Use *U,
   return true;
 }
 
-void AAMemoryBehaviorFloating::analyzeUseIn(Attributor &A, const Use *U,
+void AAMemoryBehaviorFloating::analyzeUseIn(Attributor &A, const Use &U,
                                             const Instruction *UserI) {
   assert(UserI->mayReadOrWriteMemory());
 
@@ -7194,7 +7164,7 @@ void AAMemoryBehaviorFloating::analyzeUseIn(Attributor &A, const Use *U,
     // Stores cause the NO_WRITES property to disappear if the use is the
     // pointer operand. Note that we do assume that capturing was taken care of
     // somewhere else.
-    if (cast<StoreInst>(UserI)->getPointerOperand() == U->get())
+    if (cast<StoreInst>(UserI)->getPointerOperand() == U.get())
       removeAssumedBits(NO_WRITES);
     return;
 
@@ -7206,14 +7176,14 @@ void AAMemoryBehaviorFloating::analyzeUseIn(Attributor &A, const Use *U,
     const auto *CB = cast<CallBase>(UserI);
 
     // Give up on operand bundles.
-    if (CB->isBundleOperand(U)) {
+    if (CB->isBundleOperand(&U)) {
       indicatePessimisticFixpoint();
       return;
     }
 
     // Calling a function does read the function pointer, maybe write it if the
     // function is self-modifying.
-    if (CB->isCallee(U)) {
+    if (CB->isCallee(&U)) {
       removeAssumedBits(NO_READS);
       break;
     }
@@ -7221,8 +7191,8 @@ void AAMemoryBehaviorFloating::analyzeUseIn(Attributor &A, const Use *U,
     // Adjust the possible access behavior based on the information on the
     // argument.
     IRPosition Pos;
-    if (U->get()->getType()->isPointerTy())
-      Pos = IRPosition::callsite_argument(*CB, CB->getArgOperandNo(U));
+    if (U.get()->getType()->isPointerTy())
+      Pos = IRPosition::callsite_argument(*CB, CB->getArgOperandNo(&U));
     else
       Pos = IRPosition::callsite_function(*CB);
     const auto &MemBehaviorAA =
@@ -7519,7 +7489,7 @@ void AAMemoryLocationImpl::categorizePtrValue(
                     << getMemoryLocationsAsStr(State.getAssumed()) << "]\n");
 
   SmallVector<Value *, 8> Objects;
-  if (!getAssumedUnderlyingObjects(A, Ptr, Objects, *this, &I)) {
+  if (!AA::getAssumedUnderlyingObjects(A, Ptr, Objects, *this, &I)) {
     LLVM_DEBUG(
         dbgs() << "[AAMemoryLocation] Pointer locations not categorized\n");
     updateStateAndAccessesMap(State, NO_UNKOWN_MEM, &I, nullptr, Changed,
@@ -8261,9 +8231,20 @@ struct AAValueConstantRangeFloating : AAValueConstantRangeImpl {
       Instruction *I = dyn_cast<Instruction>(&V);
       if (!I || isa<CallBase>(I)) {
 
+        // Simplify the operand first.
+        bool UsedAssumedInformation = false;
+        const auto &SimplifiedOpV =
+            A.getAssumedSimplified(IRPosition::value(V, getCallBaseContext()),
+                                   *this, UsedAssumedInformation);
+        if (!SimplifiedOpV.hasValue())
+          return true;
+        Value *VPtr = &V;
+        if (*SimplifiedOpV)
+          VPtr = *SimplifiedOpV;
+
         // If the value is not instruction, we query AA to Attributor.
         const auto &AA = A.getAAFor<AAValueConstantRange>(
-            *this, IRPosition::value(V, getCallBaseContext()),
+            *this, IRPosition::value(*VPtr, getCallBaseContext()),
             DepClassTy::REQUIRED);
 
         // Clamp operator is not used to utilize a program point CtxI.
