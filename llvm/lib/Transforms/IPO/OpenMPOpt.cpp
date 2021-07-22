@@ -56,6 +56,11 @@ static cl::opt<bool> EnableParallelRegionMerging(
     cl::desc("Enable the OpenMP region merging optimization."), cl::Hidden,
     cl::init(false));
 
+static cl::opt<bool>
+    DisableInternalization("openmp-opt-disable-internalization", cl::ZeroOrMore,
+                           cl::desc("Disable function internalization."),
+                           cl::Hidden, cl::init(false));
+
 static cl::opt<bool> PrintICVValues("openmp-print-icv-values", cl::init(false),
                                     cl::Hidden);
 static cl::opt<bool> PrintOpenMPKernels("openmp-print-gpu-kernels",
@@ -409,6 +414,7 @@ struct OMPInformationCache : public InformationCache {
     RTLFunctions.insert(F);                                                    \
     if (declMatchesRTFTypes(F, OMPBuilder._ReturnType, ArgsTypes)) {           \
       RuntimeFunctionIDMap[F] = _Enum;                                         \
+      F->removeFnAttr(Attribute::NoInline);                                    \
       auto &RFI = RFIs[_Enum];                                                 \
       RFI.Kind = _Enum;                                                        \
       RFI.Name = _Name;                                                        \
@@ -784,7 +790,8 @@ struct OpenMPOpt {
       Use &U, OMPInformationCache::RuntimeFunctionInfo *RFI = nullptr) {
     CallInst *CI = dyn_cast<CallInst>(U.getUser());
     if (CI && CI->isCallee(&U) && !CI->hasOperandBundles() &&
-        (!RFI || CI->getCalledFunction() == RFI->Declaration))
+        (!RFI ||
+         (RFI->Declaration && CI->getCalledFunction() == RFI->Declaration)))
       return CI;
     return nullptr;
   }
@@ -795,7 +802,8 @@ struct OpenMPOpt {
       Value &V, OMPInformationCache::RuntimeFunctionInfo *RFI = nullptr) {
     CallInst *CI = dyn_cast<CallInst>(&V);
     if (CI && !CI->hasOperandBundles() &&
-        (!RFI || CI->getCalledFunction() == RFI->Declaration))
+        (!RFI ||
+         (RFI->Declaration && CI->getCalledFunction() == RFI->Declaration)))
       return CI;
     return nullptr;
   }
@@ -2457,7 +2465,8 @@ ChangeStatus AAExecutionDomainFunction::updateImpl(Attributor &A) {
     // Match:  -1 == __kmpc_target_init (for non-SPMD kernels only!)
     if (C->isAllOnesValue()) {
       auto *CB = dyn_cast<CallBase>(Cmp->getOperand(0));
-      if (!CB || CB->getCalledFunction() != RFI.Declaration)
+      CB = CB ? OpenMPOpt::getCallIfRegularCall(*CB, &RFI) : nullptr;
+      if (!CB)
         return false;
       const int InitIsSPMDArgNo = 1;
       auto *IsSPMDModeCI =
@@ -2886,8 +2895,12 @@ struct AAKernelInfoFunction : AAKernelInfo {
     assert(ExecMode->getInitializer() &&
            ExecMode->getInitializer()->isOneValue() &&
            "Initially non-SPMD kernel has SPMD exec mode!");
-    ExecMode->setInitializer(
-        ConstantInt::get(ExecMode->getInitializer()->getType(), 0));
+
+    // Set the global exec mode flag to indicate SPMD-Generic mode.
+    constexpr int SPMDGeneric = 2;
+    if (!ExecMode->getInitializer()->isZeroValue())
+      ExecMode->setInitializer(
+          ConstantInt::get(ExecMode->getInitializer()->getType(), SPMDGeneric));
 
     // Next rewrite the init and deinit calls to indicate we use SPMD-mode now.
     const int InitIsSPMDArgNo = 1;
@@ -3043,6 +3056,14 @@ struct AAKernelInfoFunction : AAKernelInfo {
                            Kernel, UserCodeEntryBB);
     BasicBlock *StateMachineDoneBarrierBB = BasicBlock::Create(
         Ctx, "worker_state_machine.done.barrier", Kernel, UserCodeEntryBB);
+    A.registerManifestAddedBasicBlock(*InitBB);
+    A.registerManifestAddedBasicBlock(*UserCodeEntryBB);
+    A.registerManifestAddedBasicBlock(*StateMachineBeginBB);
+    A.registerManifestAddedBasicBlock(*StateMachineFinishedBB);
+    A.registerManifestAddedBasicBlock(*StateMachineIsActiveCheckBB);
+    A.registerManifestAddedBasicBlock(*StateMachineIfCascadeCurrentBB);
+    A.registerManifestAddedBasicBlock(*StateMachineEndParallelBB);
+    A.registerManifestAddedBasicBlock(*StateMachineDoneBarrierBB);
 
     const DebugLoc &DLoc = KernelInitCB->getDebugLoc();
     ReturnInst::Create(Ctx, StateMachineFinishedBB)->setDebugLoc(DLoc);
@@ -3497,6 +3518,9 @@ struct AAFoldRuntimeCallCallSiteReturned : AAFoldRuntimeCall {
     case OMPRTL___kmpc_is_spmd_exec_mode:
       Changed |= foldIsSPMDExecMode(A);
       break;
+    case OMPRTL___kmpc_is_generic_main_thread_id:
+      Changed |= foldIsGenericMainThread(A);
+      break;
     default:
       llvm_unreachable("Unhandled OpenMP runtime function!");
     }
@@ -3511,6 +3535,10 @@ struct AAFoldRuntimeCallCallSiteReturned : AAFoldRuntimeCall {
       Instruction &CB = *getCtxI();
       A.changeValueAfterManifest(CB, **SimplifiedValue);
       A.deleteAfterManifest(CB);
+
+      LLVM_DEBUG(dbgs() << TAG << "Folding runtime call: " << CB << " with "
+                        << **SimplifiedValue << "\n");
+
       Changed = ChangeStatus::CHANGED;
     }
 
@@ -3587,6 +3615,28 @@ private:
                                                     : ChangeStatus::CHANGED;
   }
 
+  /// Fold __kmpc_is_generic_main_thread_id into a constant if possible.
+  ChangeStatus foldIsGenericMainThread(Attributor &A) {
+    Optional<Value *> SimplifiedValueBefore = SimplifiedValue;
+
+    CallBase &CB = cast<CallBase>(getAssociatedValue());
+    Function *F = CB.getFunction();
+    const auto &ExecutionDomainAA = A.getAAFor<AAExecutionDomain>(
+        *this, IRPosition::function(*F), DepClassTy::REQUIRED);
+
+    if (!ExecutionDomainAA.isValidState())
+      return indicatePessimisticFixpoint();
+
+    auto &Ctx = getAnchorValue().getContext();
+    if (ExecutionDomainAA.isExecutedByInitialThreadOnly(CB))
+      SimplifiedValue = ConstantInt::get(Type::getInt8Ty(Ctx), true);
+    else
+      return indicatePessimisticFixpoint();
+
+    return SimplifiedValue == SimplifiedValueBefore ? ChangeStatus::UNCHANGED
+                                                    : ChangeStatus::CHANGED;
+  }
+
   /// An optional value the associated value is assumed to fold to. That is, we
   /// assume the associated value (which is a call) can be replaced by this
   /// simplified value.
@@ -3612,6 +3662,19 @@ void OpenMPOpt::registerAAs(bool IsModulePass) {
           IRPosition::function(*Kernel), /* QueryingAA */ nullptr,
           DepClassTy::NONE, /* ForceUpdate */ false,
           /* UpdateAfterInit */ false);
+
+    auto &IsMainRFI =
+        OMPInfoCache.RFIs[OMPRTL___kmpc_is_generic_main_thread_id];
+    IsMainRFI.foreachUse(SCC, [&](Use &U, Function &F) {
+      CallInst *CI = OpenMPOpt::getCallIfRegularCall(U, &IsMainRFI);
+      if (!CI)
+        return false;
+      A.getOrCreateAAFor<AAFoldRuntimeCall>(
+          IRPosition::callsite_returned(*CI), /* QueryingAA */ nullptr,
+          DepClassTy::NONE, /* ForceUpdate */ false,
+          /* UpdateAfterInit */ false);
+      return false;
+    });
 
     auto &IsSPMDRFI = OMPInfoCache.RFIs[OMPRTL___kmpc_is_spmd_exec_mode];
     IsSPMDRFI.foreachUse(SCC, [&](Use &U, Function &) {
@@ -3812,7 +3875,8 @@ PreservedAnalyses OpenMPOptPass::run(Module &M, ModuleAnalysisManager &AM) {
   DenseSet<const Function *> InternalizedFuncs;
   if (isOpenMPDevice(M))
     for (Function &F : M)
-      if (!F.isDeclaration() && !Kernels.contains(&F) && IsCalled(F)) {
+      if (!F.isDeclaration() && !Kernels.contains(&F) && IsCalled(F) &&
+          !DisableInternalization) {
         if (Attributor::internalizeFunction(F, /* Force */ true)) {
           InternalizedFuncs.insert(&F);
         } else if (!F.hasLocalLinkage() && !F.hasFnAttribute(Attribute::Cold)) {

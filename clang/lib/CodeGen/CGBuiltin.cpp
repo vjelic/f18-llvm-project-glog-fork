@@ -15726,6 +15726,41 @@ Value *CodeGenFunction::EmitPPCBuiltinExpr(unsigned BuiltinID,
     Builder.getFastMathFlags() &= (FMF);
     return FDiv;
   }
+  case PPC::BI__builtin_ppc_fric:
+    return RValue::get(emitUnaryMaybeConstrainedFPBuiltin(
+                           *this, E, Intrinsic::rint,
+                           Intrinsic::experimental_constrained_rint))
+        .getScalarVal();
+  case PPC::BI__builtin_ppc_frim:
+  case PPC::BI__builtin_ppc_frims:
+    return RValue::get(emitUnaryMaybeConstrainedFPBuiltin(
+                           *this, E, Intrinsic::floor,
+                           Intrinsic::experimental_constrained_floor))
+        .getScalarVal();
+  case PPC::BI__builtin_ppc_frin:
+  case PPC::BI__builtin_ppc_frins:
+    return RValue::get(emitUnaryMaybeConstrainedFPBuiltin(
+                           *this, E, Intrinsic::round,
+                           Intrinsic::experimental_constrained_round))
+        .getScalarVal();
+  case PPC::BI__builtin_ppc_frip:
+  case PPC::BI__builtin_ppc_frips:
+    return RValue::get(emitUnaryMaybeConstrainedFPBuiltin(
+                           *this, E, Intrinsic::ceil,
+                           Intrinsic::experimental_constrained_ceil))
+        .getScalarVal();
+  case PPC::BI__builtin_ppc_friz:
+  case PPC::BI__builtin_ppc_frizs:
+    return RValue::get(emitUnaryMaybeConstrainedFPBuiltin(
+                           *this, E, Intrinsic::trunc,
+                           Intrinsic::experimental_constrained_trunc))
+        .getScalarVal();
+  case PPC::BI__builtin_ppc_fsqrt:
+  case PPC::BI__builtin_ppc_fsqrts:
+    return RValue::get(emitUnaryMaybeConstrainedFPBuiltin(
+                           *this, E, Intrinsic::sqrt,
+                           Intrinsic::experimental_constrained_sqrt))
+        .getScalarVal();
   }
 }
 
@@ -17600,63 +17635,6 @@ Value *CodeGenFunction::EmitWebAssemblyBuiltinExpr(unsigned BuiltinID,
     Function *Callee = CGM.getIntrinsic(Intrinsic::wasm_swizzle);
     return Builder.CreateCall(Callee, {Src, Indices});
   }
-  case WebAssembly::BI__builtin_wasm_extract_lane_s_i8x16:
-  case WebAssembly::BI__builtin_wasm_extract_lane_u_i8x16:
-  case WebAssembly::BI__builtin_wasm_extract_lane_s_i16x8:
-  case WebAssembly::BI__builtin_wasm_extract_lane_u_i16x8:
-  case WebAssembly::BI__builtin_wasm_extract_lane_i32x4:
-  case WebAssembly::BI__builtin_wasm_extract_lane_i64x2:
-  case WebAssembly::BI__builtin_wasm_extract_lane_f32x4:
-  case WebAssembly::BI__builtin_wasm_extract_lane_f64x2: {
-    llvm::APSInt LaneConst =
-        *E->getArg(1)->getIntegerConstantExpr(getContext());
-    Value *Vec = EmitScalarExpr(E->getArg(0));
-    Value *Lane = llvm::ConstantInt::get(getLLVMContext(), LaneConst);
-    Value *Extract = Builder.CreateExtractElement(Vec, Lane);
-    switch (BuiltinID) {
-    case WebAssembly::BI__builtin_wasm_extract_lane_s_i8x16:
-    case WebAssembly::BI__builtin_wasm_extract_lane_s_i16x8:
-      return Builder.CreateSExt(Extract, ConvertType(E->getType()));
-    case WebAssembly::BI__builtin_wasm_extract_lane_u_i8x16:
-    case WebAssembly::BI__builtin_wasm_extract_lane_u_i16x8:
-      return Builder.CreateZExt(Extract, ConvertType(E->getType()));
-    case WebAssembly::BI__builtin_wasm_extract_lane_i32x4:
-    case WebAssembly::BI__builtin_wasm_extract_lane_i64x2:
-    case WebAssembly::BI__builtin_wasm_extract_lane_f32x4:
-    case WebAssembly::BI__builtin_wasm_extract_lane_f64x2:
-      return Extract;
-    default:
-      llvm_unreachable("unexpected builtin ID");
-    }
-  }
-  case WebAssembly::BI__builtin_wasm_replace_lane_i8x16:
-  case WebAssembly::BI__builtin_wasm_replace_lane_i16x8:
-  case WebAssembly::BI__builtin_wasm_replace_lane_i32x4:
-  case WebAssembly::BI__builtin_wasm_replace_lane_i64x2:
-  case WebAssembly::BI__builtin_wasm_replace_lane_f32x4:
-  case WebAssembly::BI__builtin_wasm_replace_lane_f64x2: {
-    llvm::APSInt LaneConst =
-        *E->getArg(1)->getIntegerConstantExpr(getContext());
-    Value *Vec = EmitScalarExpr(E->getArg(0));
-    Value *Lane = llvm::ConstantInt::get(getLLVMContext(), LaneConst);
-    Value *Val = EmitScalarExpr(E->getArg(2));
-    switch (BuiltinID) {
-    case WebAssembly::BI__builtin_wasm_replace_lane_i8x16:
-    case WebAssembly::BI__builtin_wasm_replace_lane_i16x8: {
-      llvm::Type *ElemType =
-          cast<llvm::VectorType>(ConvertType(E->getType()))->getElementType();
-      Value *Trunc = Builder.CreateTrunc(Val, ElemType);
-      return Builder.CreateInsertElement(Vec, Trunc, Lane);
-    }
-    case WebAssembly::BI__builtin_wasm_replace_lane_i32x4:
-    case WebAssembly::BI__builtin_wasm_replace_lane_i64x2:
-    case WebAssembly::BI__builtin_wasm_replace_lane_f32x4:
-    case WebAssembly::BI__builtin_wasm_replace_lane_f64x2:
-      return Builder.CreateInsertElement(Vec, Val, Lane);
-    default:
-      llvm_unreachable("unexpected builtin ID");
-    }
-  }
   case WebAssembly::BI__builtin_wasm_add_sat_s_i8x16:
   case WebAssembly::BI__builtin_wasm_add_sat_u_i8x16:
   case WebAssembly::BI__builtin_wasm_add_sat_s_i16x8:
@@ -17837,7 +17815,8 @@ Value *CodeGenFunction::EmitWebAssemblyBuiltinExpr(unsigned BuiltinID,
   }
   case WebAssembly::BI__builtin_wasm_popcnt_i8x16: {
     Value *Vec = EmitScalarExpr(E->getArg(0));
-    Function *Callee = CGM.getIntrinsic(Intrinsic::wasm_popcnt);
+    Function *Callee =
+        CGM.getIntrinsic(Intrinsic::ctpop, ConvertType(E->getType()));
     return Builder.CreateCall(Callee, {Vec});
   }
   case WebAssembly::BI__builtin_wasm_any_true_v128:
@@ -17931,16 +17910,6 @@ Value *CodeGenFunction::EmitWebAssemblyBuiltinExpr(unsigned BuiltinID,
         llvm::ConstantVector::get({Builder.getInt32(0), Builder.getInt32(1),
                                    Builder.getInt32(2), Builder.getInt32(3)});
     return Builder.CreateShuffleVector(Trunc, Splat, ConcatMask);
-  }
-  case WebAssembly::BI__builtin_wasm_load32_zero: {
-    Value *Ptr = EmitScalarExpr(E->getArg(0));
-    Function *Callee = CGM.getIntrinsic(Intrinsic::wasm_load32_zero);
-    return Builder.CreateCall(Callee, {Ptr});
-  }
-  case WebAssembly::BI__builtin_wasm_load64_zero: {
-    Value *Ptr = EmitScalarExpr(E->getArg(0));
-    Function *Callee = CGM.getIntrinsic(Intrinsic::wasm_load64_zero);
-    return Builder.CreateCall(Callee, {Ptr});
   }
   case WebAssembly::BI__builtin_wasm_shuffle_i8x16: {
     Value *Ops[18];

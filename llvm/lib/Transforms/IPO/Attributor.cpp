@@ -801,6 +801,9 @@ bool Attributor::isAssumedDead(const Instruction &I,
   const IRPosition::CallBaseContext *CBCtx =
       QueryingAA ? QueryingAA->getCallBaseContext() : nullptr;
 
+  if (ManifestAddedBlocks.contains(I.getParent()))
+    return false;
+
   if (!FnLivenessAA)
     FnLivenessAA =
         lookupAAFor<AAIsDead>(IRPosition::function(*I.getFunction(), CBCtx),
@@ -877,8 +880,7 @@ bool Attributor::isAssumedDead(const IRPosition &IRP,
 
 bool Attributor::checkForAllUses(function_ref<bool(const Use &, bool &)> Pred,
                                  const AbstractAttribute &QueryingAA,
-                                 const Value &V,
-                                 bool CheckBBLivenessOnly,
+                                 const Value &V, bool CheckBBLivenessOnly,
                                  DepClassTy LivenessDepClass) {
 
   // Check the trivial case first as it catches void values.
@@ -1441,7 +1443,9 @@ ChangeStatus Attributor::cleanupIR() {
                     << ToBeDeletedBlocks.size() << " blocks and "
                     << ToBeDeletedInsts.size() << " instructions and "
                     << ToBeChangedValues.size() << " values and "
-                    << ToBeChangedUses.size() << " uses\n");
+                    << ToBeChangedUses.size() << " uses. "
+                    << "Preserve manifest added " << ManifestAddedBlocks.size()
+                    << " blocks\n");
 
   SmallVector<WeakTrackingVH, 32> DeadInsts;
   SmallVector<Instruction *, 32> TerminatorsToFold;
@@ -1602,6 +1606,9 @@ ChangeStatus Attributor::cleanupIR() {
       assert(isRunOn(*BB->getParent()) &&
              "Cannot delete a block outside the current SCC!");
       CGModifiedFunctions.insert(BB->getParent());
+      // Do not delete BBs added during manifests of AAs.
+      if (ManifestAddedBlocks.contains(BB))
+        continue;
       ToBeDeletedBBs.push_back(BB);
     }
     // Actually we do not delete the blocks but squash them into a single
@@ -2575,8 +2582,9 @@ void AbstractAttribute::printWithDeps(raw_ostream &OS) const {
   OS << '\n';
 }
 
-raw_ostream &llvm::operator<<(raw_ostream &OS, const AAPointerInfo::Access &Acc) {
-  OS << " ["<< Acc.getKind() << "] " << *Acc.getRemoteInst();
+raw_ostream &llvm::operator<<(raw_ostream &OS,
+                              const AAPointerInfo::Access &Acc) {
+  OS << " [" << Acc.getKind() << "] " << *Acc.getRemoteInst();
   if (Acc.getLocalInst() != Acc.getRemoteInst())
     OS << " via " << *Acc.getLocalInst() << "\n";
   return OS;
