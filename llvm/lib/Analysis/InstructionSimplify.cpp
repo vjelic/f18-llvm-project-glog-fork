@@ -5781,15 +5781,16 @@ static Value *simplifyIntrinsic(CallBase *Call, const SimplifyQuery &Q) {
   if (!NumOperands) {
     switch (IID) {
     case Intrinsic::vscale: {
+      // Call may not be inserted into the IR yet at point of calling simplify.
+      if (!Call->getParent() || !Call->getParent()->getParent())
+        return nullptr;
       auto Attr = Call->getFunction()->getFnAttribute(Attribute::VScaleRange);
       if (!Attr.isValid())
         return nullptr;
-      unsigned MinScalarVectorSize, MaxScalarVectorSize;
-      std::tie(MinScalarVectorSize, MaxScalarVectorSize) =
-          Attr.getVScaleRangeArgs();
-      if (MinScalarVectorSize == MaxScalarVectorSize &&
-          MaxScalarVectorSize != 0)
-        return ConstantInt::get(F->getReturnType(), MinScalarVectorSize);
+      unsigned VScaleMin, VScaleMax;
+      std::tie(VScaleMin, VScaleMax) = Attr.getVScaleRangeArgs();
+      if (VScaleMin == VScaleMax && VScaleMax != 0)
+        return ConstantInt::get(F->getReturnType(), VScaleMin);
       return nullptr;
     }
     default:
