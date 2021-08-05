@@ -95,10 +95,17 @@ AArch64LegalizerInfo::AArch64LegalizerInfo(const AArch64Subtarget &ST)
             return std::make_pair(0, EltTy);
           });
 
-  getActionDefinitionsBuilder(G_PHI).legalFor({p0, s16, s32, s64})
+  getActionDefinitionsBuilder(G_PHI)
+      .legalFor({p0, s16, s32, s64})
       .legalFor(PackedVectorAllTypeList)
+      .widenScalarToNextPow2(0)
       .clampScalar(0, s16, s64)
-      .widenScalarToNextPow2(0);
+      // Maximum: sN * k = 128
+      .clampMaxNumElements(0, s8, 16)
+      .clampMaxNumElements(0, s16, 8)
+      .clampMaxNumElements(0, s32, 4)
+      .clampMaxNumElements(0, s64, 2)
+      .clampMaxNumElements(0, p0, 2);
 
   getActionDefinitionsBuilder(G_BSWAP)
       .legalFor({s32, s64, v4s32, v2s32, v2s64})
@@ -459,10 +466,10 @@ AArch64LegalizerInfo::AArch64LegalizerInfo(const AArch64Subtarget &ST)
   // Conversions
   getActionDefinitionsBuilder({G_FPTOSI, G_FPTOUI})
       .legalForCartesianProduct({s32, s64, v2s64, v4s32, v2s32})
-      .clampScalar(0, s32, s64)
       .widenScalarToNextPow2(0)
-      .clampScalar(1, s32, s64)
-      .widenScalarToNextPow2(1);
+      .clampScalar(0, s32, s64)
+      .widenScalarToNextPow2(1)
+      .clampScalar(1, s32, s64);
 
   getActionDefinitionsBuilder({G_SITOFP, G_UITOFP})
       .legalForCartesianProduct({s32, s64, v2s64, v4s32, v2s32})
