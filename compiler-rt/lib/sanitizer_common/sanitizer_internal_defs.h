@@ -139,7 +139,7 @@ namespace __sanitizer {
 typedef unsigned long long uptr;
 typedef signed long long sptr;
 #else
-#  if (SANITIZER_WORDSIZE == 64)
+#  if (SANITIZER_WORDSIZE == 64) || SANITIZER_MAC
 typedef unsigned long uptr;
 typedef signed long sptr;
 #  else
