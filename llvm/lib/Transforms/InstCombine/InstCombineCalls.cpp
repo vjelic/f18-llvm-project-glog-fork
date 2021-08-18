@@ -796,13 +796,12 @@ static Instruction *foldClampRangeOfTwo(IntrinsicInst *II,
 }
 
 /// Reduce a sequence of min/max intrinsics with a common operand.
-static Instruction *factorizeMinMaxTree(IntrinsicInst *II,
-                                        InstCombiner::BuilderTy &Builder) {
+static Instruction *factorizeMinMaxTree(IntrinsicInst *II) {
   // Match 3 of the same min/max ops. Example: umin(umin(), umin()).
   auto *LHS = dyn_cast<IntrinsicInst>(II->getArgOperand(0));
   auto *RHS = dyn_cast<IntrinsicInst>(II->getArgOperand(1));
   Intrinsic::ID MinMaxID = II->getIntrinsicID();
-  if (!LHS || !RHS || LHS->getIntrinsicID() !=  MinMaxID ||
+  if (!LHS || !RHS || LHS->getIntrinsicID() != MinMaxID ||
       RHS->getIntrinsicID() != MinMaxID ||
       (!LHS->hasOneUse() && !RHS->hasOneUse()))
     return nullptr;
@@ -1065,6 +1064,18 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {
       }
     }
 
+    if (IID == Intrinsic::smax || IID == Intrinsic::smin) {
+      // smax (neg nsw X), (neg nsw Y) --> neg nsw (smin X, Y)
+      // smin (neg nsw X), (neg nsw Y) --> neg nsw (smax X, Y)
+      // TODO: Canonicalize neg after min/max if I1 is constant.
+      if (match(I0, m_NSWNeg(m_Value(X))) && match(I1, m_NSWNeg(m_Value(Y))) &&
+          (I0->hasOneUse() || I1->hasOneUse())) {
+        Intrinsic::ID InvID = getInverseMinMaxIntrinsic(IID);
+        Value *InvMaxMin = Builder.CreateBinaryIntrinsic(InvID, X, Y);
+        return BinaryOperator::CreateNSWNeg(InvMaxMin);
+      }
+    }
+
     if (match(I0, m_Not(m_Value(X)))) {
       // max (not X), (not Y) --> not (min X, Y)
       Intrinsic::ID InvID = getInverseMinMaxIntrinsic(IID);
@@ -1117,7 +1128,7 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {
         if (Instruction *R = FoldOpIntoSelect(*II, Sel))
           return R;
 
-    if (Instruction *NewMinMax = factorizeMinMaxTree(II, Builder))
+    if (Instruction *NewMinMax = factorizeMinMaxTree(II))
        return NewMinMax;
 
     break;
@@ -2425,55 +2436,46 @@ void InstCombinerImpl::annotateAnyAllocSite(CallBase &Call, const TargetLibraryI
 
   if (isMallocLikeFn(&Call, TLI) && Op0C) {
     if (isOpNewLikeFn(&Call, TLI))
-      Call.addAttribute(AttributeList::ReturnIndex,
-                        Attribute::getWithDereferenceableBytes(
-                            Call.getContext(), Op0C->getZExtValue()));
+      Call.addRetAttr(Attribute::getWithDereferenceableBytes(
+          Call.getContext(), Op0C->getZExtValue()));
     else
-      Call.addAttribute(AttributeList::ReturnIndex,
-                        Attribute::getWithDereferenceableOrNullBytes(
-                            Call.getContext(), Op0C->getZExtValue()));
+      Call.addRetAttr(Attribute::getWithDereferenceableOrNullBytes(
+          Call.getContext(), Op0C->getZExtValue()));
   } else if (isAlignedAllocLikeFn(&Call, TLI)) {
     if (Op1C)
-      Call.addAttribute(AttributeList::ReturnIndex,
-                        Attribute::getWithDereferenceableOrNullBytes(
-                            Call.getContext(), Op1C->getZExtValue()));
+      Call.addRetAttr(Attribute::getWithDereferenceableOrNullBytes(
+          Call.getContext(), Op1C->getZExtValue()));
     // Add alignment attribute if alignment is a power of two constant.
     if (Op0C && Op0C->getValue().ult(llvm::Value::MaximumAlignment) &&
         isKnownNonZero(Call.getOperand(1), DL, 0, &AC, &Call, &DT)) {
       uint64_t AlignmentVal = Op0C->getZExtValue();
       if (llvm::isPowerOf2_64(AlignmentVal)) {
-        Call.removeAttribute(AttributeList::ReturnIndex, Attribute::Alignment);
-        Call.addAttribute(AttributeList::ReturnIndex,
-                          Attribute::getWithAlignment(Call.getContext(),
-                                                      Align(AlignmentVal)));
+        Call.removeRetAttr(Attribute::Alignment);
+        Call.addRetAttr(Attribute::getWithAlignment(Call.getContext(),
+                                                    Align(AlignmentVal)));
       }
     }
   } else if (isReallocLikeFn(&Call, TLI) && Op1C) {
-    Call.addAttribute(AttributeList::ReturnIndex,
-                      Attribute::getWithDereferenceableOrNullBytes(
-                          Call.getContext(), Op1C->getZExtValue()));
+    Call.addRetAttr(Attribute::getWithDereferenceableOrNullBytes(
+        Call.getContext(), Op1C->getZExtValue()));
   } else if (isCallocLikeFn(&Call, TLI) && Op0C && Op1C) {
     bool Overflow;
     const APInt &N = Op0C->getValue();
     APInt Size = N.umul_ov(Op1C->getValue(), Overflow);
     if (!Overflow)
-      Call.addAttribute(AttributeList::ReturnIndex,
-                        Attribute::getWithDereferenceableOrNullBytes(
-                            Call.getContext(), Size.getZExtValue()));
+      Call.addRetAttr(Attribute::getWithDereferenceableOrNullBytes(
+          Call.getContext(), Size.getZExtValue()));
   } else if (isStrdupLikeFn(&Call, TLI)) {
     uint64_t Len = GetStringLength(Call.getOperand(0));
     if (Len) {
       // strdup
       if (NumArgs == 1)
-        Call.addAttribute(AttributeList::ReturnIndex,
-                          Attribute::getWithDereferenceableOrNullBytes(
-                              Call.getContext(), Len));
+        Call.addRetAttr(Attribute::getWithDereferenceableOrNullBytes(
+            Call.getContext(), Len));
       // strndup
       else if (NumArgs == 2 && Op1C)
-        Call.addAttribute(
-            AttributeList::ReturnIndex,
-            Attribute::getWithDereferenceableOrNullBytes(
-                Call.getContext(), std::min(Len, Op1C->getZExtValue() + 1)));
+        Call.addRetAttr(Attribute::getWithDereferenceableOrNullBytes(
+            Call.getContext(), std::min(Len, Op1C->getZExtValue() + 1)));
     }
   }
 }
@@ -2675,7 +2677,7 @@ Instruction *InstCombinerImpl::visitCallBase(CallBase &Call) {
         // isKnownNonNull -> nonnull attribute
         if (!GCR.hasRetAttr(Attribute::NonNull) &&
             isKnownNonZero(DerivedPtr, DL, 0, &AC, &Call, &DT)) {
-          GCR.addAttribute(AttributeList::ReturnIndex, Attribute::NonNull);
+          GCR.addRetAttr(Attribute::NonNull);
           // We discovered new fact, re-check users.
           Worklist.pushUsersToWorkList(GCR);
         }
